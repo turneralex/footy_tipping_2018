@@ -1,0 +1,752 @@
+---
+title: "Footy Tipping 2018 - A Data Visualisation"
+author: "Alexander Turner"
+output: html_document
+---
+
+## Intro
+
+In this analysis I've produced a number of data visualisations for the 2018 footy tipping season using data from my [ESPN footytips](http://www.footytips.com.au/) comp. I hope you enjoy having a look at what I've thrown together and encourage you to suggest areas for improvement and / or other plots to add. I'm still fairly new to R so that also includes coding suggestions.
+
+All the plots are created using the [`ggplot2`](https://ggplot2.tidyverse.org/) package, which is probably the best data visualisation tool available (at least for R). It's just one of the many gems in the [`tidyverse`](https://www.tidyverse.org/), a bunch of packages that I've used heavily in this work as they're so good to work with. I'll add some tips / comments here and there throughout this document, but this is by no means a tutorial in R programming or data visualisation. Also, because of the nature of the data used, this project doesn't fully showcase all the things `ggplot2` is capable of (which is basically any data visualisation you can think of when you factor in all the extension packages). 
+
+If you find this type of thing interesting, feel free to check out some of my other work at [turneralex.github.io](https://turneralex.github.io/)
+
+To replicate this particular piece of work, head over to my [GitHub](https://github.com/turneralex/footy-tipping-2018) to get the R scripts and then read through the instructions below (the instructions are also in the GitHub repo). If you have a comp with more than 11 tippers, you will have to make some edits to the code. I'll make sure to mention when this is required.  
+
+## Required packages
+
+With the exception of `knitr`, which is just used to demonstrate the required .csv data format for importing and displaying data frames, all of these packages need to be loaded to run the R script that prepares the data and generates the plots.
+
+```{r message=FALSE, warning=FALSE}
+library(knitr)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(forcats)
+library(magrittr)
+library(ggplot2)
+library(ggforce)
+```
+
+## Data import
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+footy_tips <- read_csv("./footy_tips.csv")
+total_margin <- read_csv("./total_margin.csv")
+```
+
+In order to import the data to [RStudio](https://www.rstudio.com/) correctly so the script will run, the files must be .csv and in the following format. If you did tipping through the ESPN site, you can download a .csv of the data easily from their desktop site. 
+
+__`footy_tips`:__ this the file containing the primary data - round by round tipping scores. Ensure the column titles are the same (or adjust the script accordingly). 
+```{r}
+footy_tips %>% 
+  select(1:10) %>% 
+  slice(1:5) %>% 
+  mutate(tipper = map_chr(1:5, ~ paste("tipper", .))) %>% 
+  kable()
+```
+
+__`total_margin`:__ This is the file containing the margin data. ESPN uses this as a tiebreaker for the leaderboard when 2 tippers are tied for tipping score. Each week tippers select the winning margin for the first game of the round and their margin score is the cumulative difference between their predicted margin and the actual margin. The lower margin score, the better. If a tipper selects Team A to win by 10 points and they're defeated by 25 points, this will result in 35 being added to their margin. Again, keep the column titles the same or adjust the script.
+
+```{r}
+total_margin %>% 
+  slice(1:5) %>% 
+  mutate(tipper = map_chr(1:5, ~ paste("tipper", .))) %>% 
+  kable()
+```
+
+Here is the actual code for importing the data. Note in the file paths forward slashes are used rather than backslashes. 
+
+```{r eval=FALSE}
+footy_tips <- read_csv("./footy_tips.csv")
+total_margin <- read_csv("./total_margin.csv")
+```
+
+## Data prep
+
+For anyone that wants to see the R code for used for the data prep, it is included at the end of the document in an appendix. If you do have a look, there are some comments to help you get an idea of what's been doing done.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# create vector of round labels for various data frames
+rounds <- map_chr(seq_along(footy_tips[,-1]), ~ paste("Round", .))
+
+# add round mean row
+footy_tips <- footy_tips %>% 
+  bind_rows(c(tipper = "Mean", map(footy_tips[,-1], ~ mean(.) %>% round(1))))
+
+# convert tipper variable to factor
+footy_tips$tipper <- footy_tips$tipper %>% factor()
+
+# display data frame (only rounds 1-10)
+footy_tips %>% 
+  select(1:11)%>% 
+  kable()
+
+# create data frame with cumulative total tips by tipper
+cumulative_scores <- footy_tips[,-1] %>% 
+  pmap(lift_vd(cumsum)) %>% 
+  invoke(bind_rows, .) %>% 
+  bind_cols(tipper = footy_tips$tipper, .) %>% 
+  gather(round, cumulative_score, -1)
+
+# convert round variable to factor
+cumulative_scores$round <- cumulative_scores$round %>%  
+  factor(levels = footy_tips[,-1] %>% colnames(),
+         labels = rounds,
+         ordered = T)
+
+# display data frame (only rounds 1-2)
+cumulative_scores %>% 
+  filter(round %in% rounds[1:2]) %>% 
+  kable()
+
+# create data frame of summary stats by tipper
+tipper_stats <- data_frame(
+  tipper = footy_tips$tipper,
+  total_score = footy_tips[,-1] %>% rowSums(), 
+  max = footy_tips[,-1] %>% pmap_dbl(max),
+  min = footy_tips[,-1] %>% pmap_dbl(min),
+  mean = footy_tips[,-1] %>% rowMeans() %>% round(1),
+  standard_deviation = footy_tips[,-1] %>% pmap_dbl(lift_vd(sd)) %>% round(1),
+  total_margin = c(total_margin$total_margin, NA)
+)
+
+# ensure tipper order is correct (based on tips & margin)
+tipper_stats <- tipper_stats %>% 
+  filter(tipper != "Mean") %>% 
+  arrange(desc(total_score), total_margin) %>% 
+  bind_rows(filter(tipper_stats, tipper == "Mean"))
+
+# add columns for +/- vs mean, above / below average & rank
+tipper_stats <- tipper_stats %>% 
+  mutate(
+    plus_minus_mean = c(
+      filter(tipper_stats, tipper != "Mean")$total_score - filter(tipper_stats, tipper == "Mean")$total_score,
+      NA # the NA is added as this obviously doesn't apply for the mean
+    ), 
+    above_below_average = if_else(
+      plus_minus_mean > 0,
+      "Above Average",
+      "Below Average"
+    ),
+    rank = c(1:(nrow(tipper_stats) - 1), NA)
+  )
+
+# convert above / below average variable to factor
+# R always sorts factors in alphabetical order so simply reversing this 
+# will set the order correctly for this ordinal variable
+tipper_stats$above_below_average <- tipper_stats$above_below_average %>% 
+  factor(ordered = T) %>% 
+  fct_rev()
+
+# display data frame
+tipper_stats %>% kable()
+
+# create long format tipper stats data frame for plotting
+tipper_stats_long <- tipper_stats[,1:6] %>% 
+  filter(tipper != "Mean") %>% 
+  gather(variable, value, -1)
+
+# convert variable column to factor
+tipper_stats_long$variable <- tipper_stats_long$variable %>% 
+  factor(levels = tipper_stats[,2:6] %>% colnames(),
+         labels = c("Total Score", "Max", "Min", "Mean", "Standard Deviation"))
+
+# display data frame
+tipper_stats_long %>% kable()
+
+# create data frame of summary stats by round
+round_stats <- data_frame(
+  round = rounds %>% factor(levels = rounds, ordered = T),
+  max = footy_tips[,-1] %>% map_dbl(max),
+  min = footy_tips[,-1] %>% map_dbl(min),
+  mean = footy_tips %>% 
+    filter(tipper != "Mean") %>% 
+    select(-1) %>% 
+    colMeans() %>% 
+    round(1),
+  standard_deviation = footy_tips %>% 
+    filter(tipper != "Mean") %>% 
+    select(-1) %>% 
+    map_dbl(sd) %>% 
+    round(1)
+)
+
+# add columns for round type, +/- vs mean & above / below average
+round_stats <- round_stats %>% 
+  mutate(
+    round_type = if_else(
+      round %in% rounds[12:14], 
+      "Bye Round", 
+      "Standard Round"
+    ),
+    plus_minus_mean = mean - mean(mean), 
+    # i'll admit this code looks a bit odd, but it works fine 
+    # this is because there were the same number of tippers for 
+    # each round, so it is okay to the mean of the mean
+    above_below_average = if_else(
+      plus_minus_mean > 0,
+      "Above Average",
+      "Below Average"
+    )
+  )
+
+# convert round type variable to factor
+round_stats$round_type <- round_stats$round_type %>% factor()
+
+# same as before 
+round_stats$above_below_average <- round_stats$above_below_average %>% 
+  factor(ordered = T) %>% 
+  fct_rev()
+
+# display data frame
+round_stats %>% kable()
+
+# create long format round stats data frame for plotting
+round_stats_long <- round_stats[,1:5] %>%
+  gather(variable, value, -1)
+
+# convert variable column to factor
+round_stats_long$variable <- round_stats_long$variable %>% 
+  factor(levels = round_stats[,2:5] %>% colnames(),
+         labels = c("Max", "Min", "Mean", "Standard Deviation"))
+
+# display data frame
+round_stats_long %>% kable()
+
+# create long format data frame for round scores to be used for plotting
+round_scores <- footy_tips %>% 
+  filter(tipper != "Mean") %>% 
+  gather(round, score, -1)
+
+# define round variable as ordered factor
+round_scores$round <- round_scores$round %>% 
+  factor(levels = footy_tips[,-1] %>% colnames(),
+         labels = rounds,
+         ordered = T)
+
+# add column for round type
+round_scores <- round_scores %>% 
+  mutate(
+    round_type = if_else(
+    round %in% rounds[12:14], 
+    "Bye Round", 
+    "Standard Round"
+  ) 
+)
+
+# define round type variable as factor
+round_scores$round_type <- round_scores$round_type %>% factor()
+
+# display data frame (only rounds 1-2)
+round_scores %>% 
+  filter(round %in% rounds[1:2]) %>% 
+  kable()
+
+# create data frames for fixing plot axes, adding labels to facets etc
+fix_y_tipper <- data.frame( # using data.frame instead of data_frame here to avoid different column length errors
+  tipper = c(sort(footy_tips$tipper)[1], 
+             sort(footy_tips$tipper)[length(footy_tips$tipper)]),
+  variable = c(rep("Max", 2), 
+               rep("Min", 2)),
+  value = c(0,9)
+)
+
+fix_y_round <- data.frame(
+  round = c(rounds[1], rounds[length(rounds)]),
+  variable = c(rep("Max", 2), rep("Min", 2)),
+  value = c(0,9)
+)
+
+round_score_label <- data.frame(
+  tipper = sort(footy_tips$tipper)[length(footy_tips$tipper) / 2],
+  round = rounds[12:14],
+  score = 8
+)
+
+hist_means <- data.frame(
+  mean = c(filter(round_scores, round_type == "Standard Round")$score %>% mean(),
+            filter(round_scores, round_type == "Bye Round")$score %>% mean()),
+  round_type = c("Standard Round", "Bye Round")
+)
+```
+
+## Now for the plots
+
+Starting with the most obvious, the final leaderboard (including margin tiebreaker).
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+tipper_stats %>% 
+  filter(tipper != "Mean") %>% 
+  ggplot(aes(fct_reorder(tipper, -rank), total_score)) +
+  geom_point(colour = "red3", size = 4) +
+  geom_segment(aes(x = tipper,
+                   xend = tipper,
+                   y =  0,
+                   yend = total_score),
+               colour = "red3",
+               linetype = "dashed",
+               size = 1.5) +
+  geom_text(label = filter(tipper_stats, tipper != "Mean")$total_score, 
+            hjust = -1,
+            size = 3) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, max(tipper_stats$total_score) + 1)) +
+  labs(title = "Final Leaderboard Line Plot",
+       x = "Tipper",
+       y = "Total Score") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) 
+
+ggplot(round_scores, aes(round, fct_rev(tipper), fill = score)) +
+  geom_raster() +
+  labs(title = "Heat Map of Tipper Round Scores",
+       x = "Round",
+       y = "Tipper",
+       fill = "Round Score") +
+  scale_fill_gradient(low = "white",
+                      high = "red", 
+                      limits = c(0, 9), 
+                      breaks = seq(0, 9, by = 1)) +
+  guides(fill = guide_colourbar(ticks = F)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5)) 
+
+round_plot <- round_scores %>% 
+  ggplot(aes(tipper, score)) +
+  geom_point(size = 2) +
+  geom_hline(data = round_stats, 
+             aes(yintercept = mean, linetype = ""),
+             colour = "red",
+             size = 1.2,
+             alpha = 0.5) +
+  geom_label(data = round_score_label, label = "Bye Round", size = 4) +
+  scale_linetype_manual("Mean", values = "solid") +
+  scale_y_continuous(limits = c(0, 9), breaks = seq(0, 9, by = 1)) +
+  labs(title = "Point Plot by Round",
+       x = "Tipper",
+       y = "Score") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5)) 
+
+map(1:6, ~ round_plot + facet_wrap_paginate(~ round, nrow = 2, ncol = 2, page = .))
+
+tipper_plot <- round_scores %>% 
+  ggplot(aes(round, score)) +
+  geom_point(size = 3) +
+  geom_point(data = round_stats, 
+             aes(round, mean, shape = ""), 
+             colour = "red",
+             size = 3,
+             alpha = 0.5) +
+  scale_shape_manual("Mean", values = 16) +
+  scale_y_continuous(limits = c(0, 9), breaks = seq(0, 9, by = 1)) +
+  labs(title = "Point Plot by Tipper",
+     x = "Round",
+     y = "Score") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5))
+
+map(1:6, ~ tipper_plot + facet_wrap_paginate(~ tipper, nrow = 2, ncol = 1, page = .))
+
+ggplot(round_scores, aes(round, score)) +
+  geom_jitter(colour = "dodgerblue", size = 3, width = 0.15, alpha = 0.8) +
+  stat_summary(fun.y = "mean", 
+               aes(shape = "Mean"), 
+               geom = "point", 
+               colour = "red",
+               size = 4,
+               alpha = 0.8) +
+  stat_summary(fun.data = "mean_cl_boot", 
+               geom = "errorbar", 
+               colour = "red",
+               size = 1,
+               width = 0.2,
+               alpha = 0.8) +
+  scale_shape_manual("", values = 18) +
+  scale_y_continuous(limits = c(-0.5, 9.5), breaks = seq(0, 9, by = 1)) +
+  labs(title = "Jitter Plot by Round", 
+       subtitle = "Confidence Intervals: Bootstrap 95%",
+       x = "Round", 
+       y = "Score") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5))
+
+ggplot(round_scores, aes(fct_reorder(tipper, -score, sum), score)) +
+  geom_jitter(colour = "aquamarine4", size = 3, width = 0.2, alpha = 0.8) +
+  stat_summary(fun.y = "mean", 
+               aes(shape = "Mean"), 
+               geom = "point", 
+               colour = "red",
+               size = 4,
+               alpha = 0.8) +
+  stat_summary(fun.data = "mean_cl_boot", 
+               geom = "errorbar", 
+               colour = "red",
+               size = 1,
+               width = 0.2,
+               alpha = 0.8) +
+  scale_shape_manual("", values = 18) +
+  scale_y_continuous(limits = c(-0.5, 9.5), breaks = seq(0, 9, by = 1)) +
+  labs(title = "Jitter Plot by Tipper", 
+       subtitle = "Confidence Intervals: Bootstrap 95%",
+       x = "Tipper", 
+       y = "Round Scores") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5))
+
+ggplot(round_scores, aes(score)) +
+  geom_histogram(binwidth = 1, colour = "black", fill  = "khaki2") +
+  geom_vline(aes(xintercept = mean(score), linetype = ""),
+             size = 2) +
+  scale_x_continuous(breaks = seq(0, 9, by = 1)) +
+  scale_linetype_manual("Mean", values = "solid") +
+  labs(title = "Histogram of All Scores",
+       x = "Round Score",
+       y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(round_scores, aes(score, fill = fct_rev(round_type))) +
+  geom_histogram(binwidth = 1, colour = "black") +
+  facet_wrap(~ fct_rev(round_type)) +
+  geom_vline(data = hist_means, 
+             aes(xintercept = mean, linetype = ""), 
+             colour = "black",
+             size = 1.5) +
+  scale_fill_brewer(palette = "Pastel2") +
+  scale_x_continuous(breaks = seq(0, 9, by = 1)) +
+  scale_linetype_manual("Mean", values = "solid") +
+  labs(title = "Histogram of All Scores - Split by Round Type",
+       x = "Round Score",
+       y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  guides(fill = F)
+
+ggplot(round_scores, aes(score, fill = tipper)) +
+  geom_histogram(binwidth = 1, colour = "white") +
+  scale_fill_brewer(palette = "Paired") +
+  scale_x_continuous(breaks = seq(0, 9, by = 1)) +
+  facet_wrap(~ tipper) +
+  geom_vline(data = filter(tipper_stats, tipper != "Mean"),
+             aes(xintercept = mean, linetype = ""),
+             size = 1.5) +
+  scale_linetype_manual("Mean", values = "dotted") +
+  labs(title = "Histogram of All Scores by Tipper",
+       x = "Round Score",
+       y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  guides(fill = F) 
+
+tipper_stats %>% 
+  filter(tipper != "Mean") %>% 
+  ggplot(aes(fct_reorder(tipper, rank), 
+             plus_minus_mean, 
+             colour = above_below_average)) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 1.2) +
+  geom_point(size = 6) +
+  scale_colour_manual(values = c("red", "forestgreen")) +
+  labs(title = "Point Plot of Above / Below Mean by Tipper",
+       x = "Tipper",
+       y = "+ / - vs Mean") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5)) +
+  guides(colour = F)
+
+ggplot(round_stats, 
+       aes(round, 
+           plus_minus_mean, 
+           colour = above_below_average,
+           shape = fct_rev(round_type))) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 1.2) +
+  geom_point(size = 6) +
+  scale_colour_manual(values = c("red", "forestgreen")) +
+  scale_shape_manual(values = c(16, 18)) +
+  labs(title = "Point Plot of Above / Below Mean by Round",
+       x = "Round",
+       y = "+ / - vs Mean",
+       shape = "Round Type") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5)) +
+  guides(colour = F)
+
+ggplot(round_stats, 
+       aes(fct_reorder(round, -mean), 
+           plus_minus_mean, 
+           colour = above_below_average,
+           shape = fct_rev(round_type))) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 1.2) +
+  geom_point(size = 6) +
+  scale_colour_manual(values = c("red", "forestgreen")) +
+  scale_shape_manual(values = c(16, 18)) +
+  labs(title = "Point Plot of Above / Below Mean for Rounds (Descending Order)",
+       x = "Round",
+       y = "+ / - vs Mean",
+       shape = "Round Type") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5)) +
+  guides(colour = F)
+
+cumulative_scores %>% 
+  filter(tipper != "Mean") %>% 
+  ggplot(aes(round, cumulative_score, group = tipper, colour = tipper)) +
+  geom_line(size = 1) +
+  scale_colour_brewer(palette = "Paired") +
+  labs(title = "Line Plot of Cumulative Tipper Scores",
+       x = "Round",
+       y = "Cumulative Score",
+       colour = "Tipper") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5)) 
+
+ggplot(tipper_stats_long, aes(tipper, value, fill = variable)) +
+  geom_col() +
+  facet_wrap(~ variable, scales = "free") +
+  scale_fill_brewer(palette = "Set2") +
+  geom_text(label = tipper_stats_long$value, vjust = 1.5) +
+  geom_blank(data = fix_y_tipper) +
+  labs(title = "Summary Stats by Tipper",
+       x = "Tipper",
+       y = "") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  guides(fill = F)
+  
+ggplot(round_stats_long, aes(round, value, fill = variable)) +
+  geom_col() +
+  facet_wrap(~ variable, scales = "free") +
+  scale_fill_brewer(palette = "Set3") +
+  geom_text(label = round_stats_long$value, size = 3, vjust = 1.5) +
+  geom_blank(data = fix_y_round) +
+  labs(title = "Summary Stats by Round",
+       x = "Round",
+       y = "") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 60, vjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  guides(fill = F)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+rm(list = ls())
+footy_tips <- read_csv("C:/RStudio Projects/Personal Projects/Footy Tipping 2018/footy_tips.csv")
+total_margin <- read_csv("C:/RStudio Projects/Personal Projects/Footy Tipping 2018/total_margin.csv")
+```
+
+
+## Appendix - data prep
+
+```{r message=FALSE, warning=FALSE}
+# create vector of round labels for various data frames
+rounds <- map_chr(seq_along(footy_tips[,-1]), ~ paste("Round", .))
+
+# add round mean row
+footy_tips <- footy_tips %>% 
+  bind_rows(c(tipper = "Mean", map(footy_tips[,-1], ~ mean(.) %>% round(1))))
+
+# convert tipper variable to factor
+footy_tips$tipper <- footy_tips$tipper %>% factor()
+
+# display data frame (only rounds 1-10)
+footy_tips %>% 
+  select(1:11) %>% 
+  kable()
+
+# create data frame with cumulative total tips by tipper
+cumulative_scores <- footy_tips[,-1] %>% 
+  pmap(lift_vd(cumsum)) %>% 
+  invoke(bind_rows, .) %>% 
+  bind_cols(tipper = footy_tips$tipper, .) %>% 
+  gather(round, cumulative_score, -1)
+
+# convert round variable to factor
+cumulative_scores$round <- cumulative_scores$round %>%  
+  factor(levels = footy_tips[,-1] %>% colnames(),
+         labels = rounds,
+         ordered = T)
+
+# display data frame (only rounds 1-2)
+cumulative_scores %>% 
+  filter(round %in% rounds[1:2]) %>% 
+  kable()
+
+# create data frame of summary stats by tipper
+tipper_stats <- data_frame(
+  tipper = footy_tips$tipper,
+  total_score = footy_tips[,-1] %>% rowSums(), 
+  max = footy_tips[,-1] %>% pmap_dbl(max),
+  min = footy_tips[,-1] %>% pmap_dbl(min),
+  mean = footy_tips[,-1] %>% rowMeans() %>% round(1),
+  standard_deviation = footy_tips[,-1] %>% pmap_dbl(lift_vd(sd)) %>% round(1),
+  total_margin = c(total_margin$total_margin, NA)
+)
+
+# ensure tipper order is correct (based on tips & margin)
+tipper_stats <- tipper_stats %>% 
+  filter(tipper != "Mean") %>% 
+  arrange(desc(total_score), total_margin) %>% 
+  bind_rows(filter(tipper_stats, tipper == "Mean"))
+
+# add columns for +/- vs mean, above / below average & rank
+tipper_stats <- tipper_stats %>% 
+  mutate(
+    plus_minus_mean = c(
+      filter(tipper_stats, tipper != "Mean")$total_score - filter(tipper_stats, tipper == "Mean")$total_score,
+      NA # the NA is added as this obviously doesn't apply for the mean
+    ), 
+    above_below_average = if_else(
+      plus_minus_mean > 0,
+      "Above Average",
+      "Below Average"
+    ),
+    rank = c(1:(nrow(tipper_stats) - 1), NA)
+  )
+
+# convert above / below average variable to factor
+# R always sorts factors in alphabetical order so simply reversing this 
+# will set the order correctly for this ordinal variable
+tipper_stats$above_below_average <- tipper_stats$above_below_average %>% 
+  factor(ordered = T) %>% 
+  fct_rev()
+
+# display data frame
+tipper_stats %>% kable()
+
+# create long format tipper stats data frame for plotting
+tipper_stats_long <- tipper_stats[,1:6] %>% 
+  filter(tipper != "Mean") %>% 
+  gather(variable, value, -1)
+
+# convert variable column to factor
+tipper_stats_long$variable <- tipper_stats_long$variable %>% 
+  factor(levels = tipper_stats[,2:6] %>% colnames(),
+         labels = c("Total Score", "Max", "Min", "Mean", "Standard Deviation"))
+
+# display data frame
+tipper_stats_long %>% kable()
+
+# create data frame of summary stats by round
+round_stats <- data_frame(
+  round = rounds %>% factor(levels = rounds, ordered = T),
+  max = footy_tips[,-1] %>% map_dbl(max),
+  min = footy_tips[,-1] %>% map_dbl(min),
+  mean = footy_tips%>% 
+    filter(tipper != "Mean") %>% 
+    select(-1) %>% 
+    colMeans() %>% 
+    round(1),
+  standard_deviation = footy_tips %>% 
+    filter(tipper != "Mean") %>% 
+    select(-1) %>% 
+    map_dbl(sd) %>% 
+    round(1)
+)
+
+# add columns for round type, +/- vs mean & above / below average
+round_stats <- round_stats %>% 
+  mutate(
+    round_type = if_else(
+      round %in% rounds[12:14], 
+      "Bye Round", 
+      "Standard Round"
+    ),
+    plus_minus_mean = mean - mean(mean), 
+    # i'll admit this code looks a bit odd, but it works fine 
+    # this is because there were the same number of tippers for 
+    # each round, so it is okay to the mean of the mean
+    above_below_average = if_else(
+      plus_minus_mean > 0,
+      "Above Average",
+      "Below Average"
+    )
+  )
+
+# convert round type variable to factor
+round_stats$round_type <- round_stats$round_type %>% factor()
+
+# same as before 
+round_stats$above_below_average <- round_stats$above_below_average %>% 
+  factor(ordered = T) %>% 
+  fct_rev()
+
+# display data frame
+round_stats %>% kable()
+
+# create long format round stats data frame for plotting
+round_stats_long <- round_stats[,1:5] %>%
+  gather(variable, value, -1)
+
+# convert variable column to factor
+round_stats_long$variable <- round_stats_long$variable %>% 
+  factor(levels = round_stats[,2:5] %>% colnames(),
+         labels = c("Max", "Min", "Mean", "Standard Deviation"))
+
+# display data frame
+round_stats_long %>% kable()
+
+# create long format data frame for round scores to be used for plotting
+round_scores <- footy_tips %>% 
+  filter(tipper != "Mean") %>% 
+  gather(round, score, -1)
+
+# define round variable as ordered factor
+round_scores$round <- round_scores$round %>% 
+  factor(levels = footy_tips[,-1] %>% colnames(),
+         labels = rounds,
+         ordered = T)
+
+# add column for round type
+round_scores <- round_scores %>% 
+  mutate(
+    round_type = if_else(
+    round %in% rounds[12:14], 
+    "Bye Round", 
+    "Standard Round"
+  ) 
+)
+
+# define round type variable as factor
+round_scores$round_type <- round_scores$round_type %>% factor()
+
+# display data frame (only rounds 1-2)
+round_scores %>% 
+  filter(round %in% rounds[1:2]) %>% 
+  kable()
+
+# create data frames for fixing plot axes, adding labels to facets etc
+fix_y_tipper <- data.frame( # using data.frame instead of data_frame here to avoid different column length errors
+  tipper = c(sort(footy_tips$tipper)[1], 
+             sort(footy_tips$tipper)[length(footy_tips$tipper)]),
+  variable = c(rep("Max", 2), 
+               rep("Min", 2)),
+  value = c(0,9)
+)
+
+fix_y_round <- data.frame(
+  round = c(rounds[1], rounds[length(rounds)]),
+  variable = c(rep("Max", 2), rep("Min", 2)),
+  value = c(0,9)
+)
+
+round_score_label <- data.frame(
+  tipper = sort(footy_tips$tipper)[length(footy_tips$tipper) / 2],
+  round = rounds[12:14],
+  score = 8
+)
+
+hist_means <- data.frame(
+  mean = c(filter(round_scores, round_type == "Standard Round")$score %>% mean(),
+            filter(round_scores, round_type == "Bye Round")$score %>% mean()),
+  round_type = c("Standard Round", "Bye Round")
+)
+```
+ 
